@@ -1,0 +1,6 @@
+anthropic
+yfinance
+finnhub-python
+twilio
+requests
+pytz
