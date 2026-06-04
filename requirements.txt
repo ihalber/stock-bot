@@ -4,3 +4,4 @@ finnhub-python
 twilio
 requests
 pytz
+python-dotenv
