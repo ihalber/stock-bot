@@ -7,6 +7,8 @@ from twilio.rest import Client
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import pytz
+from flask import Flask, request, Response
+from twilio.twiml.messaging_response import MessagingResponse
 
 load_dotenv()
 
@@ -17,6 +19,8 @@ TWILIO_SID        = os.environ["TWILIO_ACCOUNT_SID"]
 TWILIO_AUTH       = os.environ["TWILIO_AUTH_TOKEN"]
 TWILIO_FROM       = os.environ["TWILIO_WHATSAPP_FROM"]
 WHATSAPP_TO       = os.environ["WHATSAPP_TO"]
+
+PORTFOLIO_FILE = "portfolio.json"
 
 # Candidate stocks to screen (mix of ASX and US)
 ASX_TICKERS = [
@@ -30,6 +34,52 @@ US_TICKERS = [
     "MA", "HD", "PG", "JNJ", "AVGO"
 ]
 ALL_TICKERS = ASX_TICKERS + US_TICKERS
+
+
+# ── Portfolio Management ──────────────────────────────────────────────────────
+def load_portfolio():
+    if os.path.exists(PORTFOLIO_FILE):
+        with open(PORTFOLIO_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+
+def save_portfolio(portfolio):
+    with open(PORTFOLIO_FILE, "w") as f:
+        json.dump(portfolio, f, indent=2)
+
+
+def portfolio_add(ticker, buy_price):
+    portfolio = load_portfolio()
+    ticker = ticker.upper()
+    portfolio[ticker] = {
+        "buy_price": buy_price,
+        "date_added": datetime.now().strftime("%Y-%m-%d")
+    }
+    save_portfolio(portfolio)
+    return ticker
+
+
+def portfolio_remove(ticker):
+    portfolio = load_portfolio()
+    ticker = ticker.upper()
+    if ticker in portfolio:
+        del portfolio[ticker]
+        save_portfolio(portfolio)
+        return True
+    return False
+
+
+def portfolio_summary():
+    portfolio = load_portfolio()
+    if not portfolio:
+        return "Your portfolio is empty. Use 'bought TICKER PRICE' to add a stock."
+    lines = ["*Your Portfolio:*"]
+    for ticker, info in portfolio.items():
+        lines.append("  • {} — bought at ${} on {}".format(
+            ticker, info["buy_price"], info["date_added"]
+        ))
+    return "\n".join(lines)
 
 
 # ── Data Fetching ─────────────────────────────────────────────────────────────
@@ -98,25 +148,71 @@ def get_news(ticker):
 
 
 # ── Claude Analysis ───────────────────────────────────────────────────────────
-def ask_claude(stocks_data):
+def ask_claude(stocks_data, portfolio=None):
     client = Anthropic(api_key=ANTHROPIC_API_KEY)
 
     stocks_json = json.dumps(stocks_data, indent=2)
     today_str   = datetime.now(pytz.timezone("Australia/Sydney")).strftime("%A, %d %B %Y")
 
+    # Build portfolio section if holdings exist
+    portfolio_section = ""
+    if portfolio:
+        holdings = []
+        for ticker, info in portfolio.items():
+            # Try to find current price from stocks_data
+            match = next((s for s in stocks_data if s["ticker"] == ticker), None)
+            current_price = match["price"] if match else "N/A"
+            buy_price = info["buy_price"]
+            if current_price != "N/A":
+                gain_pct = round((current_price / buy_price - 1) * 100, 2)
+                holdings.append({
+                    "ticker": ticker,
+                    "buy_price": buy_price,
+                    "current_price": current_price,
+                    "gain_loss_pct": gain_pct,
+                    "date_added": info["date_added"]
+                })
+            else:
+                holdings.append({
+                    "ticker": ticker,
+                    "buy_price": buy_price,
+                    "current_price": "unavailable",
+                    "date_added": info["date_added"]
+                })
+
+        portfolio_json = json.dumps(holdings, indent=2)
+        portfolio_section = """
+PORTFOLIO REVIEW:
+The user currently holds these stocks. For each one, provide a clear SELL, HOLD, or AVERAGE DOWN recommendation with reasoning based on current technicals, fundamentals, news, and their gain/loss position.
+
+Format each as:
+[TICKER] — SELL / HOLD / AVERAGE DOWN
+Reasoning: [2-3 sentences with specific data points]
+Bought: $[buy_price] | Now: $[current_price] | P&L: [X]%
+
+HOLDINGS:
+{}
+""".format(portfolio_json)
+
     prompt = """Today is {}. You are a professional stock analyst.
 
 Below is fundamental, technical, and news data for {} stocks across ASX and US markets.
 
-Your task:
-1. Analyse all stocks holistically — technicals, fundamentals, and news sentiment.
-2. Select the TOP 5 stocks with the best risk/reward opportunity TODAY.
-3. For each pick, write 2-3 sentences explaining WHY (mention specific data points).
-4. Rate each pick: Strong Buy / Buy / Speculative.
+{}
+
+YOUR TASKS:
+
+{}
+
+TOP 5 NEW PICKS:
+Analyse all stocks holistically — technicals, fundamentals, and news sentiment.
+Select the TOP 5 stocks with the best risk/reward opportunity TODAY.
+For each pick, write 2-3 sentences explaining WHY (mention specific data points).
+Rate each pick: Strong Buy / Buy / Speculative.
 
 Return your response in this exact format:
 
-DAILY TOP 5 STOCK PICKS — {}
+{}DAILY TOP 5 STOCK PICKS — {}
 
 1. [TICKER] — [Company Name] ([Rating])
    Reasoning: [Your 2-3 sentence reasoning]
@@ -131,11 +227,19 @@ This is AI-generated analysis, not financial advice. Always do your own research
 
 STOCK DATA:
 {}
-""".format(today_str, len(stocks_data), today_str, stocks_json)
+""".format(
+        today_str,
+        len(stocks_data),
+        portfolio_section,
+        "1. PORTFOLIO REVIEW (see holdings above)\n2. " if portfolio else "1. ",
+        "📊 PORTFOLIO REVIEW\n\n[Portfolio recommendations here]\n\n---\n\n" if portfolio else "",
+        today_str,
+        stocks_json
+    )
 
     message = client.messages.create(
         model="claude-haiku-4-5-20251001",
-        max_tokens=1500,
+        max_tokens=2000,
         messages=[{"role": "user", "content": prompt}]
     )
     return message.content[0].text
@@ -144,7 +248,6 @@ STOCK DATA:
 # ── WhatsApp Delivery ─────────────────────────────────────────────────────────
 def send_whatsapp(message):
     twilio = Client(TWILIO_SID, TWILIO_AUTH)
-    # Split into chunks of max 1500 chars at a newline boundary
     chunks = []
     while len(message) > 1500:
         split_at = message.rfind("\n", 0, 1500)
@@ -163,12 +266,64 @@ def send_whatsapp(message):
         print("WhatsApp message {} of {} sent.".format(i + 1, len(chunks)))
 
 
-# ── Main ──────────────────────────────────────────────────────────────────────
+# ── Flask Webhook ─────────────────────────────────────────────────────────────
+app = Flask(__name__)
+
+@app.route("/webhook", methods=["POST"])
+def webhook():
+    incoming = request.form.get("Body", "").strip()
+    parts = incoming.lower().split()
+    resp = MessagingResponse()
+
+    if not parts:
+        resp.message("Commands:\n• bought TICKER PRICE\n• sold TICKER\n• portfolio")
+        return Response(str(resp), mimetype="text/xml")
+
+    command = parts[0]
+
+    # bought AAPL 150
+    if command == "bought" and len(parts) >= 3:
+        try:
+            ticker = parts[1].upper()
+            price = float(parts[2])
+            portfolio_add(ticker, price)
+            resp.message("✅ Added {} to your portfolio at ${}.".format(ticker, price))
+        except ValueError:
+            resp.message("❌ Invalid price. Usage: bought AAPL 150.00")
+
+    # sold AAPL
+    elif command == "sold" and len(parts) >= 2:
+        ticker = parts[1].upper()
+        removed = portfolio_remove(ticker)
+        if removed:
+            resp.message("✅ Removed {} from your portfolio.".format(ticker))
+        else:
+            resp.message("❌ {} not found in your portfolio.".format(ticker))
+
+    # portfolio
+    elif command == "portfolio":
+        resp.message(portfolio_summary())
+
+    else:
+        resp.message("Commands:\n• bought TICKER PRICE\n• sold TICKER\n• portfolio")
+
+    return Response(str(resp), mimetype="text/xml")
+
+
+# ── Main (Cron) ───────────────────────────────────────────────────────────────
 def main():
     print("Starting stock screener — {}".format(datetime.now().strftime("%Y-%m-%d %H:%M")))
 
+    portfolio = load_portfolio()
+
+    # Fetch data for all candidate tickers + any portfolio stocks not already in the list
+    tickers_to_fetch = list(ALL_TICKERS)
+    for ticker in portfolio:
+        if ticker not in tickers_to_fetch:
+            tickers_to_fetch.append(ticker)
+
     stocks_data = []
-    for ticker in ALL_TICKERS:
+    for ticker in tickers_to_fetch:
         print("  Fetching {}...".format(ticker))
         data = get_stock_data(ticker)
         if data:
@@ -177,12 +332,13 @@ def main():
 
     print("\nGot data for {} stocks. Asking Claude...".format(len(stocks_data)))
 
-    recommendations = ask_claude(stocks_data)
+    recommendations = ask_claude(stocks_data, portfolio if portfolio else None)
     print("\n" + recommendations)
 
     send_whatsapp(recommendations)
 
 
+# ── Entry Point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     import sys
     mode = sys.argv[1] if len(sys.argv) > 1 else "web"
