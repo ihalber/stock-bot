@@ -184,4 +184,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    import sys
+    mode = sys.argv[1] if len(sys.argv) > 1 else "web"
+    if mode == "cron":
+        main()
+    else:
+        port = int(os.environ.get("PORT", 8080))
+        print("Starting Flask on port {}".format(port))
+        app.run(host="0.0.0.0", port=port)
