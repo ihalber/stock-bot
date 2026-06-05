@@ -4,3 +4,4 @@ builder = "nixpacks"
 [deploy]
 cronSchedule = "0 21 * * *"
 startCommand = "python main.py"
+cronCommand = "python main.py cron"
