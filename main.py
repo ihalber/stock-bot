@@ -7,8 +7,6 @@ from twilio.rest import Client
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 import pytz
-from flask import Flask, request, Response
-from twilio.twiml.messaging_response import MessagingResponse
 
 load_dotenv()
 
@@ -42,44 +40,6 @@ def load_portfolio():
         with open(PORTFOLIO_FILE, "r") as f:
             return json.load(f)
     return {}
-
-
-def save_portfolio(portfolio):
-    with open(PORTFOLIO_FILE, "w") as f:
-        json.dump(portfolio, f, indent=2)
-
-
-def portfolio_add(ticker, buy_price):
-    portfolio = load_portfolio()
-    ticker = ticker.upper()
-    portfolio[ticker] = {
-        "buy_price": buy_price,
-        "date_added": datetime.now().strftime("%Y-%m-%d")
-    }
-    save_portfolio(portfolio)
-    return ticker
-
-
-def portfolio_remove(ticker):
-    portfolio = load_portfolio()
-    ticker = ticker.upper()
-    if ticker in portfolio:
-        del portfolio[ticker]
-        save_portfolio(portfolio)
-        return True
-    return False
-
-
-def portfolio_summary():
-    portfolio = load_portfolio()
-    if not portfolio:
-        return "Your portfolio is empty. Use 'bought TICKER PRICE' to add a stock."
-    lines = ["*Your Portfolio:*"]
-    for ticker, info in portfolio.items():
-        lines.append("  • {} — bought at ${} on {}".format(
-            ticker, info["buy_price"], info["date_added"]
-        ))
-    return "\n".join(lines)
 
 
 # ── Data Fetching ─────────────────────────────────────────────────────────────
@@ -159,7 +119,6 @@ def ask_claude(stocks_data, portfolio=None):
     if portfolio:
         holdings = []
         for ticker, info in portfolio.items():
-            # Try to find current price from stocks_data
             match = next((s for s in stocks_data if s["ticker"] == ticker), None)
             current_price = match["price"] if match else "N/A"
             buy_price = info["buy_price"]
@@ -266,57 +225,13 @@ def send_whatsapp(message):
         print("WhatsApp message {} of {} sent.".format(i + 1, len(chunks)))
 
 
-# ── Flask Webhook ─────────────────────────────────────────────────────────────
-app = Flask(__name__)
-
-@app.route("/webhook", methods=["POST"])
-def webhook():
-    incoming = request.form.get("Body", "").strip()
-    parts = incoming.lower().split()
-    resp = MessagingResponse()
-
-    if not parts:
-        resp.message("Commands:\n• bought TICKER PRICE\n• sold TICKER\n• portfolio")
-        return Response(str(resp), mimetype="text/xml")
-
-    command = parts[0]
-
-    # bought AAPL 150
-    if command == "bought" and len(parts) >= 3:
-        try:
-            ticker = parts[1].upper()
-            price = float(parts[2])
-            portfolio_add(ticker, price)
-            resp.message("✅ Added {} to your portfolio at ${}.".format(ticker, price))
-        except ValueError:
-            resp.message("❌ Invalid price. Usage: bought AAPL 150.00")
-
-    # sold AAPL
-    elif command == "sold" and len(parts) >= 2:
-        ticker = parts[1].upper()
-        removed = portfolio_remove(ticker)
-        if removed:
-            resp.message("✅ Removed {} from your portfolio.".format(ticker))
-        else:
-            resp.message("❌ {} not found in your portfolio.".format(ticker))
-
-    # portfolio
-    elif command == "portfolio":
-        resp.message(portfolio_summary())
-
-    else:
-        resp.message("Commands:\n• bought TICKER PRICE\n• sold TICKER\n• portfolio")
-
-    return Response(str(resp), mimetype="text/xml")
-
-
-# ── Main (Cron) ───────────────────────────────────────────────────────────────
+# ── Main ──────────────────────────────────────────────────────────────────────
 def main():
     print("Starting stock screener — {}".format(datetime.now().strftime("%Y-%m-%d %H:%M")))
 
     portfolio = load_portfolio()
 
-    # Fetch data for all candidate tickers + any portfolio stocks not already in the list
+    # Fetch data for all candidate tickers + any portfolio stocks not in the list
     tickers_to_fetch = list(ALL_TICKERS)
     for ticker in portfolio:
         if ticker not in tickers_to_fetch:
@@ -338,13 +253,5 @@ def main():
     send_whatsapp(recommendations)
 
 
-# ── Entry Point ───────────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    import sys
-    mode = sys.argv[1] if len(sys.argv) > 1 else "web"
-    if mode == "cron":
-        main()
-    else:
-        port = int(os.environ.get("PORT", 8080))
-        print("Starting Flask on port {}".format(port))
-        app.run(host="0.0.0.0", port=port)
+    main()
